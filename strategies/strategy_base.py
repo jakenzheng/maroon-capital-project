@@ -231,3 +231,145 @@ class DemoStrategy(Strategy):
 ## To use your strategy:
 ##   python run_live.py --symbol AAPL --strategy mystrategy --live
 ##
+
+
+class MyStrategy(Strategy):
+    """
+    Pair mean-reversion strategy using rolling OLS hedge ratio and spread z-score.
+
+    DataFrame requirements (must include both series):
+        - Close_PM
+        - Close_MNST
+
+    Outputs:
+        - signal: target regime (+1 long spread, -1 short spread, 0 flat)
+        - position: same as signal, but held statefully with exits/stops
+        - target_qty_PM / target_qty_MNST: target shares for each leg
+        - target_qty: kept for compatibility (gross shares of PM leg)
+    """
+
+    def __init__(
+        self,
+        col_a: str = "Close_PM",
+        col_b: str = "Close_MNST",
+        lookback: int = 60,
+        entry_z: float = 2.0,
+        exit_z: float = 0.5,
+        stop_z: float = 4.0,
+        gross_notional: float = 10_000.0,   # gross dollars across both legs
+        min_periods: int | None = None,
+    ):
+        if lookback < 5:
+            raise ValueError("lookback should be at least ~5 (prefer 20-120).")
+        if entry_z <= 0 or exit_z < 0 or stop_z <= entry_z:
+            raise ValueError("Require: entry_z > 0, exit_z >= 0, stop_z > entry_z.")
+        if gross_notional <= 0:
+            raise ValueError("gross_notional must be positive.")
+        self.col_a = col_a
+        self.col_b = col_b
+        self.lookback = lookback
+        self.entry_z = entry_z
+        self.exit_z = exit_z
+        self.stop_z = stop_z
+        self.gross_notional = gross_notional
+        self.min_periods = min_periods if min_periods is not None else lookback
+
+    def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+
+        if self.col_a not in df.columns or self.col_b not in df.columns:
+            raise ValueError(f"DataFrame must contain {self.col_a} and {self.col_b}")
+
+        y = df[self.col_a].astype(float)  # PM
+        x = df[self.col_b].astype(float)  # MNST
+
+        # Rolling OLS of y on x using covariance formulas:
+        # beta = cov(x,y) / var(x), alpha = mean(y) - beta*mean(x)
+        mean_x = x.rolling(self.lookback, min_periods=self.min_periods).mean()
+        mean_y = y.rolling(self.lookback, min_periods=self.min_periods).mean()
+        mean_x2 = (x * x).rolling(self.lookback, min_periods=self.min_periods).mean()
+        mean_xy = (x * y).rolling(self.lookback, min_periods=self.min_periods).mean()
+
+        var_x = mean_x2 - mean_x * mean_x
+        cov_xy = mean_xy - mean_x * mean_y
+
+        beta = cov_xy / var_x.replace(0.0, np.nan)
+        alpha = mean_y - beta * mean_x
+
+        spread = y - (alpha + beta * x)
+
+        spread_mu = spread.rolling(self.lookback, min_periods=self.min_periods).mean()
+        spread_sigma = spread.rolling(self.lookback, min_periods=self.min_periods).std(ddof=0)
+
+        z = (spread - spread_mu) / spread_sigma.replace(0.0, np.nan)
+
+        df["hedge_beta"] = beta
+        df["hedge_alpha"] = alpha
+        df["spread"] = spread
+        df["zscore"] = z
+
+        return df
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        z = df["zscore"].to_numpy()
+        beta = df["hedge_beta"].to_numpy()
+        pa = df[self.col_a].to_numpy()  # PM price
+        pb = df[self.col_b].to_numpy()  # MNST price
+
+        n = len(df)
+        pos = np.zeros(n, dtype=int)
+
+        # Stateful position logic: enter at +/- entry_z, exit at |z|<exit_z, stop at |z|>stop_z
+        current = 0
+        for i in range(n):
+            zi = z[i]
+            if not np.isfinite(zi):
+                pos[i] = current
+                continue
+
+            if current == 0:
+                if zi <= -self.entry_z:
+                    current = 1   # long PM, short MNST
+                elif zi >= self.entry_z:
+                    current = -1  # short PM, long MNST
+            else:
+                if abs(zi) <= self.exit_z:
+                    current = 0
+                elif abs(zi) >= self.stop_z:
+                    current = 0
+
+            pos[i] = current
+
+        df["position"] = pos
+        # signal as "target position" (common pattern in simple backtest engines)
+        df["signal"] = df["position"]
+
+        # Convert position into target share quantities for each leg.
+        # Interpret beta as "MNST shares per 1 PM share" (from y ~ alpha + beta*x).
+        qty_a = np.zeros(n, dtype=float)
+        qty_b = np.zeros(n, dtype=float)
+
+        for i in range(n):
+            if pos[i] == 0:
+                continue
+            if not (np.isfinite(pa[i]) and np.isfinite(pb[i]) and pa[i] > 0 and pb[i] > 0):
+                continue
+            b = beta[i]
+            if not np.isfinite(b):
+                continue
+
+            gross_per_unit = pa[i] + abs(b) * pb[i]
+            if gross_per_unit <= 0:
+                continue
+
+            units = self.gross_notional / gross_per_unit  # "PM shares" scale
+            qty_a[i] = pos[i] * units
+            qty_b[i] = -pos[i] * b * units
+
+        df["target_qty_PM"] = qty_a
+        df["target_qty_MNST"] = qty_b
+
+        # Compatibility fields expected by the framework (single qty column).
+        df["target_qty"] = np.abs(df["target_qty_PM"])
+        return df

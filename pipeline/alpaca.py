@@ -217,7 +217,7 @@ def clean_market_data(
     if add_features:
         df["returns"] = df["Close"].pct_change().fillna(0.0)
         df["rolling_volatility"] = df["returns"].rolling(60).std().fillna(0.0)
-        df["rolling_volume"] = df["Volume"].rolling(60).mean().fillna(method="bfill")
+        df["rolling_volume"] = df["Volume"].rolling(60).mean().bfill()
         df["momentum"] = df["Close"].diff().fillna(0.0)
 
     dest_dir = _ensure_dir(dest_dir or DATA_DIR)
