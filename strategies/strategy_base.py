@@ -233,18 +233,28 @@ class DemoStrategy(Strategy):
 ##
 
 
+
 class MyStrategy(Strategy):
     """
-    Mean-reversion pairs strategy on two assets using a rolling hedge ratio and z-score of the spread.
+    Pairs mean-reversion strategy for PM (A) vs MNST (B), matching the slide:
+
+      - Positioning: Long A (PM) / Short B (MNST) only
+      - Sizing: beta-balanced notionals (defaults ~ $61k long / $39k short for $100k gross)
+      - Signal: z-score of spread = log(A) - log(B)
 
     Expected df columns:
-      - Close_A : price of asset A (e.g., PM)
-      - Close_B : price of asset B (e.g., MNST)
+      - Close_A : price of asset A (PM)
+      - Close_B : price of asset B (MNST)
 
-    Outputs:
-      - signal:  1 enter long-spread, -1 enter short-spread, 0 hold/none
-      - position: +1 long-spread, -1 short-spread, 0 flat
-      - target_qty: notional sizing scalar (you'll still need execution layer to map to A/B legs)
+    Required outputs:
+      - signal:   1 enter (or add) longA/shortB, -1 exit to flat, 0 hold
+      - position: 1 = longA/shortB, 0 = flat
+      - target_qty: shares of A to hold when in position (used by your executor)
+
+    Extra outputs (recommended for pairs execution):
+      - target_qty_b: shares of B to hold (negative when short)
+      - target_notional_a, target_notional_b: dollar notionals per leg (positive numbers)
+      - z, spread
     """
 
     def __init__(
@@ -252,7 +262,14 @@ class MyStrategy(Strategy):
         lookback: int = 60,
         entry_z: float = 2.0,
         exit_z: float = 0.5,
-        position_size: float = 1.0,   # "units" of spread; execution maps to leg notionals
+        # Interpreting "position_size" as GROSS NOTIONAL in dollars (slide uses ~$100k gross).
+        position_size: float = 100_000.0,
+        # Market betas from slide (tune as needed):
+        beta_a: float = 0.38,   # PM ~0.3/0.4
+        beta_b: float = 0.60,   # MNST ~0.6
+        # If you want to force EXACT slide notionals, set these:
+        notional_a: float | None = None,  # e.g. 61_000
+        notional_b: float | None = None,  # e.g. 39_000
         use_log: bool = True,
     ):
         if lookback < 5:
@@ -262,12 +279,34 @@ class MyStrategy(Strategy):
         if exit_z >= entry_z:
             raise ValueError("exit_z should be < entry_z (hysteresis avoids churn).")
         if position_size <= 0:
-            raise ValueError("position_size must be positive.")
+            raise ValueError("position_size (gross notional) must be positive.")
+        if beta_a <= 0 or beta_b <= 0:
+            raise ValueError("beta_a and beta_b must be positive.")
+
         self.lookback = lookback
         self.entry_z = entry_z
         self.exit_z = exit_z
-        self.position_size = position_size
+        self.gross_notional = float(position_size)
+        self.beta_a = float(beta_a)
+        self.beta_b = float(beta_b)
+        self.notional_a_fixed = None if notional_a is None else float(notional_a)
+        self.notional_b_fixed = None if notional_b is None else float(notional_b)
         self.use_log = use_log
+
+    def _compute_leg_notionals(self) -> tuple[float, float]:
+        # If user pins exact slide sizing, use it.
+        if self.notional_a_fixed is not None and self.notional_b_fixed is not None:
+            na = self.notional_a_fixed
+            nb = self.notional_b_fixed
+            if na <= 0 or nb <= 0:
+                raise ValueError("notional_a and notional_b must be positive if provided.")
+            return na, nb
+
+        # Otherwise beta-balance gross notional so beta_a * na ≈ beta_b * nb
+        # with na + nb = gross
+        na = self.gross_notional * (self.beta_b / (self.beta_a + self.beta_b))
+        nb = self.gross_notional - na
+        return float(na), float(nb)
 
     def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
@@ -275,21 +314,32 @@ class MyStrategy(Strategy):
         if "Close_A" not in df.columns or "Close_B" not in df.columns:
             raise ValueError("df must contain Close_A and Close_B.")
 
-        A = np.log(df["Close_A"]) if self.use_log else df["Close_A"]
-        B = np.log(df["Close_B"]) if self.use_log else df["Close_B"]
+        px_a = df["Close_A"].astype(float)
+        px_b = df["Close_B"].astype(float)
 
-        # Rolling hedge ratio via rolling OLS: beta = Cov(A,B)/Var(B)
-        cov = A.rolling(self.lookback).cov(B)
-        var = B.rolling(self.lookback).var()
-        df["beta"] = (cov / var).replace([np.inf, -np.inf], np.nan).ffill()
+        # Spread series (log price ratio is common for pairs)
+        if self.use_log:
+            spread = np.where((px_a > 0) & (px_b > 0), np.log(px_a) - np.log(px_b), np.nan)
+            df["spread"] = spread
+        else:
+            df["spread"] = np.where(px_b != 0, px_a / px_b, np.nan)
 
-        # Spread and z-score
-        df["spread"] = A - df["beta"] * B
-        df["spread_mean"] = df["spread"].rolling(self.lookback).mean()
-        df["spread_std"] = df["spread"].rolling(self.lookback).std().replace(0, np.nan)
+        # Rolling z-score of spread
+        df["spread_mean"] = df["spread"].rolling(self.lookback, min_periods=self.lookback).mean()
+        df["spread_std"] = df["spread"].rolling(self.lookback, min_periods=self.lookback).std()
+        df["spread_std"] = df["spread_std"].replace(0, np.nan)
 
         df["z"] = (df["spread"] - df["spread_mean"]) / df["spread_std"]
         df["z"] = df["z"].replace([np.inf, -np.inf], np.nan)
+
+        # Precompute target sizing each bar (shares), matching slide notionals
+        not_a, not_b = self._compute_leg_notionals()
+        df["target_notional_a"] = not_a
+        df["target_notional_b"] = not_b
+
+        # shares = notional / price
+        df["target_shares_a"] = np.where(px_a > 0, not_a / px_a, np.nan)
+        df["target_shares_b"] = np.where(px_b > 0, not_b / px_b, np.nan)
 
         return df
 
@@ -300,39 +350,30 @@ class MyStrategy(Strategy):
 
         z = df["z"]
 
-        # Entry rules:
-        #  - z <= -entry_z: spread is "too low" -> expect it to rise -> LONG spread
-        #  - z >= +entry_z: spread is "too high" -> expect it to fall -> SHORT spread
-        enter_long  = (z <= -self.entry_z)
-        enter_short = (z >=  self.entry_z)
-
-        # Exit rule: flatten when mean reversion has occurred
-        exit_flat = (z.abs() <= self.exit_z)
-
-        # Stateful position with hysteresis
         pos = 0
         positions = []
         signals = []
+
         for i in range(len(df)):
             zi = z.iat[i]
+
             if np.isnan(zi):
                 signals.append(0)
                 positions.append(pos)
                 continue
 
             sig = 0
+
             if pos == 0:
+                # Slide positioning: enter ONLY when PM is "cheap" vs MNST (spread low)
                 if zi <= -self.entry_z:
                     pos = 1
                     sig = 1
-                elif zi >= self.entry_z:
-                    pos = -1
-                    sig = -1
             else:
+                # Exit when mean reversion happens
                 if abs(zi) <= self.exit_z:
-                    # close
-                    sig = -pos  # signal indicates closing direction (optional semantics)
                     pos = 0
+                    sig = -1  # exit
 
             signals.append(sig)
             positions.append(pos)
@@ -340,6 +381,11 @@ class MyStrategy(Strategy):
         df["signal"] = signals
         df["position"] = positions
 
-        # Framework expects one target_qty. Treat it as spread-size scalar.
-        df["target_qty"] = (df["position"].abs() * self.position_size)
+        # Required output: target_qty.
+        # Here: target_qty = shares of A (PM) to hold when position=1.
+        df["target_qty"] = df["position"] * df["target_shares_a"]
+
+        # Extra: shares for B (MNST). Negative means short.
+        df["target_qty_b"] = -df["position"] * df["target_shares_b"]
+
         return df

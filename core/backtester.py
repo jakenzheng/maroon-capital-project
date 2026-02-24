@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -31,6 +31,12 @@ class Backtester:
     """
     Integrates market data, strategy, order management, order book, and matching
     engine components to simulate trading activity.
+
+    Supports:
+      - Single-asset streams with "Close"
+      - Pairs streams with "Close_A" and "Close_B" (two-leg backtest)
+        In pairs mode we bypass the single-asset OrderBook/OrderManager execution
+        and instead track a simple cash + holdings ledger for A/B.
     """
 
     def __init__(
@@ -65,6 +71,14 @@ class Backtester:
         self._long_avg_price = 0.0
         self._short_avg_price = 0.0
 
+        # ---------------------- pairs mode ledger ----------------------
+        # Used only when incoming rows include Close_A / Close_B.
+        self._pairs_initial_capital = float(getattr(self.order_manager, "initial_capital", 0.0))
+        self._pairs_cash = float(getattr(self.order_manager, "cash", self._pairs_initial_capital))
+        self._pairs_sh_a = 0.0
+        self._pairs_sh_b = 0.0
+        self._pairs_pos = 0
+
     # ----------------------------------------------------------------- helpers
 
     def _log(self, event_type: str, data: Dict) -> None:
@@ -90,6 +104,82 @@ class Backtester:
         self.equity_curve.append(equity)
         self.cash_history.append(self.order_manager.cash)
         self.position_history.append(self.order_manager.net_position)
+
+    def _is_pairs_row(self, latest: pd.Series) -> bool:
+        return ("Close_A" in latest.index) and ("Close_B" in latest.index)
+
+    def _pairs_equity(self, px_a: float, px_b: float) -> float:
+        return self._pairs_cash + self._pairs_sh_a * px_a + self._pairs_sh_b * px_b
+
+    def _update_equity_pairs(self, px_a: float, px_b: float) -> None:
+        equity = self._pairs_equity(px_a, px_b)
+        self.equity_curve.append(equity)
+        self.cash_history.append(self._pairs_cash)
+        self.position_history.append(self._pairs_pos)
+
+    def _pairs_rebalance(
+        self,
+        latest: pd.Series,
+        timestamp: pd.Timestamp,
+        px_a: float,
+        px_b: float,
+        fee_per_order: float = 0.0,
+    ) -> None:
+        """
+        Two-leg close-to-close rebalance:
+          position = +1 => +qtyA shares A and -|beta|*qtyA shares B
+          position = -1 => -qtyA shares A and +|beta|*qtyA shares B
+          position =  0 => flat
+
+        Trades at bar close (Close_A/Close_B). No slippage model.
+        """
+        pos_val = latest.get("position", 0)
+        pos = int(pos_val) if pd.notna(pos_val) else 0
+
+        beta_val = latest.get("beta", 1.0)
+        beta = float(beta_val) if pd.notna(beta_val) else 1.0
+        if not np.isfinite(beta):
+            beta = 1.0
+
+        qty_a_val = latest.get("target_qty", self.default_position_size)
+        qty_a = float(qty_a_val) if pd.notna(qty_a_val) else float(self.default_position_size)
+        qty_a = max(0.0, qty_a)
+
+        qty_b = abs(beta) * qty_a
+
+        tgt_a = pos * qty_a
+        tgt_b = -pos * qty_b
+
+        d_a = tgt_a - self._pairs_sh_a
+        d_b = tgt_b - self._pairs_sh_b
+
+        orders = 0
+
+        if abs(d_a) > 1e-12:
+            # Buy d_a>0 spends cash; sell d_a<0 adds cash
+            self._pairs_cash -= d_a * px_a
+            self._pairs_sh_a = tgt_a
+            orders += 1
+
+        if abs(d_b) > 1e-12:
+            self._pairs_cash -= d_b * px_b
+            self._pairs_sh_b = tgt_b
+            orders += 1
+
+        if orders > 0 and fee_per_order > 0:
+            self._pairs_cash -= fee_per_order * orders
+
+        self._pairs_pos = pos
+
+        if self.verbose and orders > 0:
+            sym = getattr(self.data_gateway, "symbol", "A/B")
+            net_pnl = self._pairs_equity(px_a, px_b) - self._pairs_initial_capital
+            print(
+                f"{timestamp:%Y-%m-%d %H:%M:%S} | REBAL {sym} "
+                f"| pos={pos:+d} beta={beta:.4f} "
+                f"| shA={self._pairs_sh_a:.4f} shB={self._pairs_sh_b:.4f} "
+                f"| net_pnl={net_pnl:+.2f}"
+            )
 
     def _apply_fill(self, order: Order, filled_qty: int, price: float) -> float:
         """
@@ -195,17 +285,38 @@ class Backtester:
         for row in self.data_gateway.stream():
             self.market_history.append(row)
             market_df = pd.DataFrame(self.market_history)
+
+            # Update context (pairs passes spread position; single passes net position)
             if hasattr(self.strategy, "update_context"):
                 try:
-                    self.strategy.update_context(position=self.order_manager.net_position)
+                    if ("Close_A" in market_df.columns) and ("Close_B" in market_df.columns):
+                        self.strategy.update_context(position=self._pairs_pos)
+                    else:
+                        self.strategy.update_context(position=self.order_manager.net_position)
                 except TypeError:
-                    # Backwards compatibility if a strategy ignores context.
                     pass
 
             signals_df = self.strategy.run(market_df)
             latest = signals_df.iloc[-1]
             timestamp = pd.Timestamp(row["Datetime"])
 
+            # -------------------- PAIRS MODE --------------------
+            if self._is_pairs_row(latest):
+                px_a = float(latest["Close_A"])
+                px_b = float(latest["Close_B"])
+
+                # Rebalance every bar to current (pos, beta, qty) targets
+                self._pairs_rebalance(
+                    latest=latest,
+                    timestamp=timestamp,
+                    px_a=px_a,
+                    px_b=px_b,
+                    fee_per_order=0.0,  # keep 0 unless you want to add a knob later
+                )
+                self._update_equity_pairs(px_a, px_b)
+                continue
+
+            # -------------------- SINGLE ASSET MODE (unchanged) --------------------
             price = float(latest["Close"])
             self._update_equity(price)
 
@@ -225,12 +336,20 @@ class Backtester:
 
                 if bid_active and pd.notna(bid_price):
                     bid_qty_val = latest.get("bid_qty", self.default_position_size)
-                    bid_qty = int(bid_qty_val) if pd.notna(bid_qty_val) and bid_qty_val > 0 else self.default_position_size
+                    bid_qty = (
+                        int(bid_qty_val)
+                        if pd.notna(bid_qty_val) and bid_qty_val > 0
+                        else self.default_position_size
+                    )
                     orders_to_submit.append((1, float(bid_price), bid_qty))
 
                 if ask_active and pd.notna(ask_price):
                     ask_qty_val = latest.get("ask_qty", self.default_position_size)
-                    ask_qty = int(ask_qty_val) if pd.notna(ask_qty_val) and ask_qty_val > 0 else self.default_position_size
+                    ask_qty = (
+                        int(ask_qty_val)
+                        if pd.notna(ask_qty_val) and ask_qty_val > 0
+                        else self.default_position_size
+                    )
                     orders_to_submit.append((-1, float(ask_price), ask_qty))
 
                 for sig, px, qty in orders_to_submit:

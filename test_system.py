@@ -20,7 +20,7 @@ DATA_DIR = Path("data")
 def create_sample_data(path: Path, periods: int = 200) -> None:
     df = pd.DataFrame(
         {
-            "Datetime": pd.date_range(start="2024-01-01 09:30", periods=periods, freq="T"),
+            "Datetime": pd.date_range(start="2026-02-18 09:30", periods=periods, freq="min"),
             "Open": np.random.uniform(100, 105, periods),
             "High": np.random.uniform(105, 110, periods),
             "Low": np.random.uniform(95, 100, periods),

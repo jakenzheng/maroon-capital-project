@@ -36,8 +36,7 @@ import pandas as pd
 from core.alpaca_trader import AlpacaTrader
 from core.logger import get_logger, get_trade_logger
 from pipeline.alpaca import clean_market_data, save_bars
-from strategies import MovingAverageStrategy, TemplateStrategy, CryptoTrendStrategy, DemoStrategy, get_strategy_class, list_strategies
-from strategies.strategies import MyStrategy
+from strategies import MyStrategy, MovingAverageStrategy, TemplateStrategy, CryptoTrendStrategy, DemoStrategy, get_strategy_class, list_strategies
 
 logger = get_logger("run_live")
 
@@ -91,8 +90,8 @@ def fetch_pairs_df(trader_a: AlpacaTrader, trader_b: AlpacaTrader) -> pd.DataFra
     Fetch bars for both symbols, align on Datetime, and return a merged
     DataFrame with Close_A and Close_B columns ready for MyStrategy.
     """
-    df_a = trader_a.get_bars()
-    df_b = trader_b.get_bars()
+    df_a = trader_a.fetch_latest_bars()
+    df_b = trader_b.fetch_latest_bars()
 
     if df_a is None or df_b is None:
         logger.error("Failed to fetch bars for one or both symbols.")
@@ -275,6 +274,48 @@ def main() -> None:
     # -------------------------------------------------------------------------
     # SINGLE SYMBOL MODE (unchanged)
     # -------------------------------------------------------------------------
+    if "," in args.symbol:
+        symbol_a, symbol_b = [s.strip() for s in args.symbol.split(",")]
+        strategy = MyStrategy(lookback=args.pairs_lookback, entry_z=args.entry_z,
+                            exit_z=args.exit_z, position_size=args.position_size)
+        trader_a = AlpacaTrader(symbol=symbol_a, asset_class=args.asset_class, timeframe=args.timeframe,
+                                lookback=args.lookback, strategy=strategy, feed=args.feed,
+                                dry_run=args.dry_run, max_order_notional=args.max_order_notional)
+        trader_b = AlpacaTrader(symbol=symbol_b, asset_class=args.asset_class, timeframe=args.timeframe,
+                                lookback=args.lookback, strategy=strategy, feed=args.feed,
+                                dry_run=args.dry_run, max_order_notional=args.max_order_notional)
+        trade_logger = get_trade_logger()
+        start_equity = trader_a.starting_equity
+        iteration_count = 0
+
+        def handle_pairs_iteration():
+            nonlocal iteration_count
+            iteration_count += 1
+            df_a = trader_a.get_bars().set_index("Datetime")[["Close"]].rename(columns={"Close": "Close_A"})
+            df_b = trader_b.get_bars().set_index("Datetime")[["Close"]].rename(columns={"Close": "Close_B"})
+            df = df_a.join(df_b, how="inner").dropna().reset_index()
+            result = strategy.run(df)
+            last = result.iloc[-1]
+            signal, qty = int(last["signal"]), float(last["target_qty"])
+            logger.info(f"z={last['z']:.3f} | signal={signal} | position={int(last['position'])} | qty={qty}")
+            if signal == 1:
+                side_a, side_b = "buy", "sell"
+            elif signal == -1:
+                side_a, side_b = "sell", "buy"
+            else:
+                return
+            if args.dry_run:
+                logger.info(f"[DRY RUN] {side_a} {qty} {symbol_a}, {side_b} {qty} {symbol_b}")
+            else:
+                trader_a.place_order(side=side_a, qty=qty)
+                trader_b.place_order(side=side_b, qty=qty)
+
+        # re-use the existing loop/summary pattern below by swapping handle_iteration
+        args._handle_iteration = handle_pairs_iteration
+        args._trade_logger = trade_logger
+        args._start_equity = start_equity
+        args._iteration_count_ref = [iteration_count]
+    
     strategy_cls = get_strategy_class(args.strategy)
     if strategy_cls is MovingAverageStrategy:
         strategy = MovingAverageStrategy(
