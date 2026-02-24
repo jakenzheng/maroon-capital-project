@@ -232,3 +232,114 @@ class DemoStrategy(Strategy):
 ##   python run_live.py --symbol AAPL --strategy mystrategy --live
 ##
 
+
+class MyStrategy(Strategy):
+    """
+    Mean-reversion pairs strategy on two assets using a rolling hedge ratio and z-score of the spread.
+
+    Expected df columns:
+      - Close_A : price of asset A (e.g., PM)
+      - Close_B : price of asset B (e.g., MNST)
+
+    Outputs:
+      - signal:  1 enter long-spread, -1 enter short-spread, 0 hold/none
+      - position: +1 long-spread, -1 short-spread, 0 flat
+      - target_qty: notional sizing scalar (you'll still need execution layer to map to A/B legs)
+    """
+
+    def __init__(
+        self,
+        lookback: int = 60,
+        entry_z: float = 2.0,
+        exit_z: float = 0.5,
+        position_size: float = 1.0,   # "units" of spread; execution maps to leg notionals
+        use_log: bool = True,
+    ):
+        if lookback < 5:
+            raise ValueError("lookback too small; use >= 5.")
+        if entry_z <= 0 or exit_z < 0:
+            raise ValueError("entry_z must be >0 and exit_z must be >=0.")
+        if exit_z >= entry_z:
+            raise ValueError("exit_z should be < entry_z (hysteresis avoids churn).")
+        if position_size <= 0:
+            raise ValueError("position_size must be positive.")
+        self.lookback = lookback
+        self.entry_z = entry_z
+        self.exit_z = exit_z
+        self.position_size = position_size
+        self.use_log = use_log
+
+    def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+
+        if "Close_A" not in df.columns or "Close_B" not in df.columns:
+            raise ValueError("df must contain Close_A and Close_B.")
+
+        A = np.log(df["Close_A"]) if self.use_log else df["Close_A"]
+        B = np.log(df["Close_B"]) if self.use_log else df["Close_B"]
+
+        # Rolling hedge ratio via rolling OLS: beta = Cov(A,B)/Var(B)
+        cov = A.rolling(self.lookback).cov(B)
+        var = B.rolling(self.lookback).var()
+        df["beta"] = (cov / var).replace([np.inf, -np.inf], np.nan).ffill()
+
+        # Spread and z-score
+        df["spread"] = A - df["beta"] * B
+        df["spread_mean"] = df["spread"].rolling(self.lookback).mean()
+        df["spread_std"] = df["spread"].rolling(self.lookback).std().replace(0, np.nan)
+
+        df["z"] = (df["spread"] - df["spread_mean"]) / df["spread_std"]
+        df["z"] = df["z"].replace([np.inf, -np.inf], np.nan)
+
+        return df
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df["signal"] = 0
+        df["position"] = 0
+
+        z = df["z"]
+
+        # Entry rules:
+        #  - z <= -entry_z: spread is "too low" -> expect it to rise -> LONG spread
+        #  - z >= +entry_z: spread is "too high" -> expect it to fall -> SHORT spread
+        enter_long  = (z <= -self.entry_z)
+        enter_short = (z >=  self.entry_z)
+
+        # Exit rule: flatten when mean reversion has occurred
+        exit_flat = (z.abs() <= self.exit_z)
+
+        # Stateful position with hysteresis
+        pos = 0
+        positions = []
+        signals = []
+        for i in range(len(df)):
+            zi = z.iat[i]
+            if np.isnan(zi):
+                signals.append(0)
+                positions.append(pos)
+                continue
+
+            sig = 0
+            if pos == 0:
+                if zi <= -self.entry_z:
+                    pos = 1
+                    sig = 1
+                elif zi >= self.entry_z:
+                    pos = -1
+                    sig = -1
+            else:
+                if abs(zi) <= self.exit_z:
+                    # close
+                    sig = -pos  # signal indicates closing direction (optional semantics)
+                    pos = 0
+
+            signals.append(sig)
+            positions.append(pos)
+
+        df["signal"] = signals
+        df["position"] = positions
+
+        # Framework expects one target_qty. Treat it as spread-size scalar.
+        df["target_qty"] = (df["position"].abs() * self.position_size)
+        return df
