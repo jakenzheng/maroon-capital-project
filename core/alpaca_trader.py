@@ -316,9 +316,121 @@ class AlpacaTrader:
             return df
         self._print_trade(decision, qty, order_id or "unknown")
         return df
+        
+    def run_once_pairs(self, trader_b: "AlpacaTrader") -> Optional[pd.DataFrame]:
+        # Fetch bars
+        df_a = self.fetch_latest_bars()
+        df_b = trader_b.fetch_latest_bars()
+        if df_a is None or df_b is None or df_a.empty or df_b.empty:
+            self._skip_trade("pairs: missing bars")
+            return None
+
+        # Merge on Datetime
+        df_a = df_a.set_index("Datetime")[["Close"]].rename(columns={"Close": "Close_A"})
+        df_b = df_b.set_index("Datetime")[["Close"]].rename(columns={"Close": "Close_B"})
+        df = df_a.join(df_b, how="inner").dropna().reset_index()
+        if df.empty:
+            self._skip_trade("pairs: no overlapping bars")
+            return None
+
+        out = self.strategy.run(df)
+        if out.empty:
+            self._skip_trade("pairs: strategy returned no rows")
+            return df
+
+        last = out.iloc[-1]
+        sig_val = last.get("signal", 0)
+        signal = int(sig_val) if pd.notna(sig_val) else 0
+
+        # -----------------------
+        # ENTRY
+        # -----------------------
+        if signal == 1:
+            # Block entry if either leg has an open order (avoid desync)
+            if self._has_open_order() or trader_b._has_open_order():
+                self._skip_trade("pairs: open order exists (entry blocked)")
+                return df
+
+            qty_a = abs(float(last.get("target_qty", 0.0)))
+            qty_b = abs(float(last.get("target_qty_b", 0.0)))
+
+            # Each leg: enforce integer shares for stocks
+            if self.asset_class == "stock":
+                qty_a = float(int(qty_a))
+            if trader_b.asset_class == "stock":
+                qty_b = float(int(qty_b))
+
+            if qty_a <= 0 or qty_b <= 0:
+                self._skip_trade("pairs: qty too small")
+                return df
+
+            # Cap per-order notional on each leg
+            price_a = float(df["Close_A"].iloc[-1])
+            price_b = float(df["Close_B"].iloc[-1])
+            dec_a = TradeDecision(side="buy",  qty=qty_a, price=price_a, order_type="market")
+            dec_b = TradeDecision(side="sell", qty=qty_b, price=price_b, order_type="market")
+            qty_a = self._cap_qty_for_notional(dec_a, qty_a)
+            qty_b = trader_b._cap_qty_for_notional(dec_b, qty_b)
+
+            if qty_a <= 0 or qty_b <= 0:
+                self._skip_trade("pairs: qty too small after notional cap")
+                return df
+
+            try:
+                oid_a = self._submit_order(dec_a, qty_a)
+                oid_b = trader_b._submit_order(dec_b, qty_b)
+            except APIError as exc:
+                self._skip_trade(f"pairs: order rejected: {exc}")
+                return df
+
+            self._print_trade(dec_a, qty_a, oid_a or "unknown")
+            trader_b._print_trade(dec_b, qty_b, oid_b or "unknown")
+            return df
+
+        # -----------------------
+        # EXIT
+        # -----------------------
+        if signal == -1:
+            # Do NOT block exits due to open orders; attempt to close anyway.
+            net_a = self._get_net_position()
+            net_b = trader_b._get_net_position()
+
+            if net_a != 0:
+                side_a = "sell" if net_a > 0 else "buy"
+                qty_a = abs(net_a)
+                if self.asset_class == "stock":
+                    qty_a = float(int(qty_a))
+                dec_a = TradeDecision(side=side_a, qty=qty_a, price=float(df["Close_A"].iloc[-1]), order_type="market")
+                try:
+                    oid_a = self._submit_order(dec_a, qty_a)
+                    self._print_trade(dec_a, qty_a, oid_a or "unknown")
+                except APIError as exc:
+                    self._skip_trade(f"pairs: close A rejected: {exc}")
+
+            if net_b != 0:
+                side_b = "sell" if net_b > 0 else "buy"
+                qty_b = abs(net_b)
+                if trader_b.asset_class == "stock":
+                    qty_b = float(int(qty_b))
+                dec_b = TradeDecision(side=side_b, qty=qty_b, price=float(df["Close_B"].iloc[-1]), order_type="market")
+                try:
+                    oid_b = trader_b._submit_order(dec_b, qty_b)
+                    trader_b._print_trade(dec_b, qty_b, oid_b or "unknown")
+                except APIError as exc:
+                    trader_b._skip_trade(f"pairs: close B rejected: {exc}")
+
+            return df
+
+        return df
 
     def run(self, iterations: int = 1, sleep_seconds: int = 60) -> None:
         for i in range(iterations):
             self.run_once()
+            if i < iterations - 1:
+                time.sleep(sleep_seconds)
+
+    def run_pairs(self, trader_b: "AlpacaTrader", iterations: int = 1, sleep_seconds: int = 60) -> None:
+        for i in range(iterations):
+            self.run_once_pairs(trader_b)
             if i < iterations - 1:
                 time.sleep(sleep_seconds)
