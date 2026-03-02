@@ -236,25 +236,7 @@ class DemoStrategy(Strategy):
 
 class MyStrategy(Strategy):
     """
-    Pairs mean-reversion strategy for PM (A) vs MNST (B), matching the slide:
-
-      - Positioning: Long A (PM) / Short B (MNST) only
-      - Sizing: beta-balanced notionals (defaults ~ $61k long / $39k short for $100k gross)
-      - Signal: z-score of spread = log(A) - log(B)
-
-    Expected df columns:
-      - Close_A : price of asset A (PM)
-      - Close_B : price of asset B (MNST)
-
-    Required outputs:
-      - signal:   1 enter (or add) longA/shortB, -1 exit to flat, 0 hold
-      - position: 1 = longA/shortB, 0 = flat
-      - target_qty: shares of A to hold when in position (used by your executor)
-
-    Extra outputs (recommended for pairs execution):
-      - target_qty_b: shares of B to hold (negative when short)
-      - target_notional_a, target_notional_b: dollar notionals per leg (positive numbers)
-      - z, spread
+    Pairs mean-reversion strategy for PM vs MNST
     """
 
     def __init__(
