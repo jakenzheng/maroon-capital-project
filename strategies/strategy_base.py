@@ -355,7 +355,7 @@ class MyStrategy(Strategy):
             sig = 0
 
             if pos == 0:
-                # enter ONLY when PM is "cheap" vs MNST (spread low)
+                # enter
                 if zi <= -self.entry_z:
                     pos = 1
                     sig = 1
