@@ -265,11 +265,6 @@ class MyStrategy(Strategy):
         self.beta_a = float(beta_a)
         self.beta_b = float(beta_b)
 
-    def _compute_leg_notionals(self) -> tuple[float, float]:
-        na = self.position_size * (self.beta_b / (self.beta_a + self.beta_b))
-        nb = self.position_size - na
-        return float(na), float(nb)
-
     def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
 
@@ -288,10 +283,11 @@ class MyStrategy(Strategy):
         df["z"] = (df["spread"] - df["spread_mean"]) / df["spread_std"]
         df["z"] = df["z"].replace([np.inf, -np.inf], np.nan)
 
-        not_a, not_b = self._compute_leg_notionals()
-
-        df["target_shares_a"] = np.where(px_a > 0, not_a / px_a, np.nan)
-        df["target_shares_b"] = np.where(px_b > 0, not_b / px_b, np.nan)
+        na = self.position_size * (self.beta_b / (self.beta_a + self.beta_b))
+        nb = self.position_size - na
+        
+        df["target_shares_a"] = np.where(px_a > 0, na / px_a, np.nan)
+        df["target_shares_b"] = np.where(px_b > 0, nb / px_b, np.nan)
 
         return df
 
