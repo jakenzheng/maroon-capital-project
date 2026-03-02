@@ -233,7 +233,6 @@ class DemoStrategy(Strategy):
 ##
 
 
-
 class MyStrategy(Strategy):
     """
     Pairs mean-reversion strategy for PM vs MNST
@@ -247,9 +246,6 @@ class MyStrategy(Strategy):
         position_size: float = 100_000.0,
         beta_a: float = 0.38, # PM
         beta_b: float = 0.60, # MNST
-        notional_a: float | None = None,
-        notional_b: float | None = None,
-        use_log: bool = True,
     ):
         if lookback < 5:
             raise ValueError("lookback too small; use >= 5.")
@@ -258,30 +254,20 @@ class MyStrategy(Strategy):
         if exit_z >= entry_z:
             raise ValueError("exit_z should be < entry_z (hysteresis avoids churn).")
         if position_size <= 0:
-            raise ValueError("position_size (gross notional) must be positive.")
+            raise ValueError("position_size must be positive.")
         if beta_a <= 0 or beta_b <= 0:
             raise ValueError("beta_a and beta_b must be positive.")
 
         self.lookback = lookback
         self.entry_z = entry_z
         self.exit_z = exit_z
-        self.gross_notional = float(position_size)
+        self.position_size = float(position_size)
         self.beta_a = float(beta_a)
         self.beta_b = float(beta_b)
-        self.notional_a_fixed = None if notional_a is None else float(notional_a)
-        self.notional_b_fixed = None if notional_b is None else float(notional_b)
-        self.use_log = use_log
 
     def _compute_leg_notionals(self) -> tuple[float, float]:
-        if self.notional_a_fixed is not None and self.notional_b_fixed is not None:
-            na = self.notional_a_fixed
-            nb = self.notional_b_fixed
-            if na <= 0 or nb <= 0:
-                raise ValueError("notional_a and notional_b must be positive if provided.")
-            return na, nb
-
-        na = self.gross_notional * (self.beta_b / (self.beta_a + self.beta_b))
-        nb = self.gross_notional - na
+        na = self.position_size * (self.beta_b / (self.beta_a + self.beta_b))
+        nb = self.position_size - na
         return float(na), float(nb)
 
     def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -293,12 +279,8 @@ class MyStrategy(Strategy):
         px_a = df["Close_A"].astype(float)
         px_b = df["Close_B"].astype(float)
 
-        if self.use_log:
-            spread = np.where((px_a > 0) & (px_b > 0), np.log(px_a) - np.log(px_b), np.nan)
-            df["spread"] = spread
-        else:
-            df["spread"] = np.where(px_b != 0, px_a / px_b, np.nan)
-
+        spread = np.where((px_a > 0) & (px_b > 0), np.log(px_a) - np.log(px_b), np.nan)
+        df["spread"] = spread
         df["spread_mean"] = df["spread"].rolling(self.lookback, min_periods=self.lookback).mean()
         df["spread_std"] = df["spread"].rolling(self.lookback, min_periods=self.lookback).std()
         df["spread_std"] = df["spread_std"].replace(0, np.nan)
@@ -307,8 +289,6 @@ class MyStrategy(Strategy):
         df["z"] = df["z"].replace([np.inf, -np.inf], np.nan)
 
         not_a, not_b = self._compute_leg_notionals()
-        df["target_notional_a"] = not_a
-        df["target_notional_b"] = not_b
 
         df["target_shares_a"] = np.where(px_a > 0, not_a / px_a, np.nan)
         df["target_shares_b"] = np.where(px_b > 0, not_b / px_b, np.nan)
@@ -357,3 +337,4 @@ class MyStrategy(Strategy):
         df["target_qty_b"] = -df["position"] * df["target_shares_b"]
 
         return df
+    
