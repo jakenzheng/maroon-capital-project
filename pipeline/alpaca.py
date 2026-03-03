@@ -138,6 +138,7 @@ def fetch_stock_bars(
     if df.empty and fallback_days > 0:
         end = pd.Timestamp.now(tz="UTC")
         start = end - pd.Timedelta(days=fallback_days)
+        print(end, start)
         bars = api.get_bars(
             symbol,
             tf,
